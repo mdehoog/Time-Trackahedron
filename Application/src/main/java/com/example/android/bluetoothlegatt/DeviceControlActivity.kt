@@ -17,27 +17,15 @@
 package com.example.android.bluetoothlegatt
 
 import android.app.Activity
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattService
-import android.content.BroadcastReceiver
-import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.ServiceConnection
+import android.content.*
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
-import android.util.Log.println
 import android.view.Menu
 import android.view.MenuItem
-import android.view.View
-import android.widget.ExpandableListView
-import android.widget.SimpleExpandableListAdapter
 import android.widget.TextView
-
-import java.util.ArrayList
-import java.util.HashMap
+import org.jetbrains.anko.doAsync
+import java.util.*
 
 /**
  * For a given BLE device, this Activity provides the user interface to connect, display data,
@@ -47,18 +35,56 @@ import java.util.HashMap
  */
 class DeviceControlActivity : Activity() {
     private var mConnectionState: TextView? = null
-    private var mDataField: TextView? = null
+    private var mPendingField: TextView? = null
+    private var mFaceField: TextView? = null
     private var mDeviceName: String? = null
     private var mDeviceAddress: String? = null
-    private var mGattServicesList: ExpandableListView? = null
     private var mBluetoothLeService: BluetoothLeService? = null
-    private var mGattCharacteristics: ArrayList<ArrayList<BluetoothGattCharacteristic>>? = ArrayList()
     private var mConnected = false
-    private var mNotifyCharacteristic: BluetoothGattCharacteristic? = null
 
-    private val LIST_NAME = "NAME"
-    private val LIST_UUID = "UUID"
+    private var pending = -1
+    private var pendingTime = System.currentTimeMillis()
+    private var face = -1
 
+    private val toggl = Toggl()
+
+    companion object {
+        private val TAG = DeviceControlActivity::class.java!!.simpleName
+        private const val CHANGE_TIME = 3000
+
+        @JvmField var EXTRAS_DEVICE_NAME = "DEVICE_NAME"
+        @JvmField var EXTRAS_DEVICE_ADDRESS = "DEVICE_ADDRESS"
+
+        private fun makeGattUpdateIntentFilter(): IntentFilter {
+            val intentFilter = IntentFilter()
+            intentFilter.addAction(BluetoothLeService.ACTION_GATT_CONNECTED)
+            intentFilter.addAction(BluetoothLeService.ACTION_GATT_DISCONNECTED)
+            intentFilter.addAction(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED)
+            intentFilter.addAction(BluetoothLeService.ACTION_DATA_AVAILABLE)
+            return intentFilter
+        }
+
+        private val faces: Array<Vector> = arrayOf(
+                Vector(74, 16, 443),
+                Vector(-105, -418, 196),
+                Vector(397, -273, 139),
+                Vector(415, 258, 106),
+                Vector(-81, 441, 143),
+                Vector(-402, 25, 200),
+                Vector(-22, -24, -565),
+                Vector(161, 404, -318),
+                Vector(450, -44, -318),
+                Vector(121, -454, -262),
+                Vector(-369, -266, -230),
+                Vector(-348, 263, -263)
+        )
+        private val scales: Array<Vector> = arrayOf(
+                Vector(-505, -521, -620),
+                Vector(549, 506, 476)
+        )
+        private val scaledFaces = faces.map { v-> v.scale(scales[0], scales[1]) }.toTypedArray()
+        private val quaternions = scaledFaces.map { v-> Quaternion.fromYawPitchRoll(v.scale(Math.PI / 180.0)) }.toTypedArray()
+    }
 
     // Code to manage Service lifecycle.
     private val mServiceConnection = object : ServiceConnection {
@@ -97,45 +123,17 @@ class DeviceControlActivity : Activity() {
                 invalidateOptionsMenu()
                 clearUI()
             } else if (BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED == action) {
-                // Show all the supported services and characteristics on the user interface.
-                displayGattServices(mBluetoothLeService!!.supportedGattServices)
+                val gattService = mBluetoothLeService!!.gattService(UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e"))
+                val characteristic = gattService!!.getCharacteristic(UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e"))
+                mBluetoothLeService!!.setCharacteristicNotification(characteristic, true)
             } else if (BluetoothLeService.ACTION_DATA_AVAILABLE == action) {
-                displayData(intent.getStringExtra(BluetoothLeService.EXTRA_DATA))
+                handleData(intent.getByteArrayExtra(BluetoothLeService.EXTRA_DATA))
             }
         }
-    }
-
-    // If a given GATT characteristic is selected, check for supported features.  This sample
-    // demonstrates 'Read' and 'Notify' features.  See
-    // http://d.android.com/reference/android/bluetooth/BluetoothGatt.html for the complete
-    // list of supported characteristic features.
-    private val servicesListClickListner = ExpandableListView.OnChildClickListener { parent, v, groupPosition, childPosition, id ->
-        if (mGattCharacteristics != null) {
-            val characteristic = mGattCharacteristics!![groupPosition][childPosition]
-            val charaProp = characteristic.properties
-            if (charaProp or BluetoothGattCharacteristic.PROPERTY_READ > 0) {
-                // If there is an active notification on a characteristic, clear
-                // it first so it doesn't update the data field on the user interface.
-                if (mNotifyCharacteristic != null) {
-                    mBluetoothLeService!!.setCharacteristicNotification(
-                            mNotifyCharacteristic!!, false)
-                    mNotifyCharacteristic = null
-                }
-                mBluetoothLeService!!.readCharacteristic(characteristic)
-            }
-            if (charaProp or BluetoothGattCharacteristic.PROPERTY_NOTIFY > 0) {
-                mNotifyCharacteristic = characteristic
-                mBluetoothLeService!!.setCharacteristicNotification(
-                        characteristic, true)
-            }
-            return@OnChildClickListener true
-        }
-        false
     }
 
     private fun clearUI() {
-        mGattServicesList!!.setAdapter(null as SimpleExpandableListAdapter?)
-        mDataField!!.setText(R.string.no_data)
+        mPendingField!!.setText(R.string.no_data)
     }
 
     public override fun onCreate(savedInstanceState: Bundle?) {
@@ -147,13 +145,12 @@ class DeviceControlActivity : Activity() {
         mDeviceAddress = intent.getStringExtra(EXTRAS_DEVICE_ADDRESS)
 
         // Sets up UI references.
-        (findViewById(R.id.device_address) as TextView).text = mDeviceAddress
-        mGattServicesList = findViewById(R.id.gatt_services_list) as ExpandableListView
-        mGattServicesList!!.setOnChildClickListener(servicesListClickListner)
-        mConnectionState = findViewById(R.id.connection_state) as TextView
-        mDataField = findViewById(R.id.data_value) as TextView
+        findViewById<TextView>(R.id.device_address).text = mDeviceAddress
+        mConnectionState = findViewById(R.id.connection_state)
+        mPendingField = findViewById(R.id.pending_value)
+        mFaceField = findViewById(R.id.face_value)
 
-        //println(mDataField)
+        //println(mPendingField)
 
         actionBar!!.title = mDeviceName
         actionBar!!.setDisplayHomeAsUpEnabled(true)
@@ -215,87 +212,43 @@ class DeviceControlActivity : Activity() {
         runOnUiThread { mConnectionState!!.setText(resourceId) }
     }
 
-    private fun displayData(data: String?) {
-        if (data != null) {
-            mDataField!!.text = data
+    private fun handleData(data: ByteArray?) {
+        // reporting frequency is approximately 7 hz
 
-            //System.out.println(data);
+        if (data == null || data.size != 6) {
+            return
         }
-    }
 
-    // Demonstrates how to iterate through the supported GATT Services/Characteristics.
-    // In this sample, we populate the data structure that is bound to the ExpandableListView
-    // on the UI.
-    private fun displayGattServices(gattServices: List<BluetoothGattService>?) {
-        if (gattServices == null) return
-        var uuid: String? = null
-        val unknownServiceString = resources.getString(R.string.unknown_service)
-        val unknownCharaString = resources.getString(R.string.unknown_characteristic)
-        val gattServiceData = ArrayList<HashMap<String, String>>()
-        val gattCharacteristicData = ArrayList<ArrayList<HashMap<String, String>>>()
-        mGattCharacteristics = ArrayList<ArrayList<BluetoothGattCharacteristic>>()
-
-        // Loops through available GATT Services.
-        for (gattService in gattServices) {
-            val currentServiceData = HashMap<String, String>()
-            uuid = gattService.uuid.toString()
-            println(uuid)
-            currentServiceData.put(
-                    LIST_NAME, SampleGattAttributes.lookup(uuid, unknownServiceString))
-            currentServiceData.put(LIST_UUID, uuid)
-            gattServiceData.add(currentServiceData)
-
-            val gattCharacteristicGroupData = ArrayList<HashMap<String, String>>()
-            val gattCharacteristics = gattService.characteristics
-            val charas = ArrayList<BluetoothGattCharacteristic>()
-
-            // Loops through available Characteristics.
-            for (gattCharacteristic in gattCharacteristics) {
-                charas.add(gattCharacteristic)
-                val currentCharaData = HashMap<String, String>()
-                uuid = gattCharacteristic.uuid.toString()
-                println(uuid)
-                println(currentCharaData)
-
-                currentCharaData.put(
-                        LIST_NAME, SampleGattAttributes.lookup(uuid, unknownCharaString))
-                currentCharaData.put(LIST_UUID, uuid)
-                gattCharacteristicGroupData.add(currentCharaData)
+        val scaled = Vector(
+                shortBytesToDouble(data[0], data[1]) * 1000.0,
+                shortBytesToDouble(data[2], data[3]) * 1000.0,
+                shortBytesToDouble(data[4], data[5]) * 1000.0
+        ).scale(scales[0], scales[1])
+        val quaternion = Quaternion.fromYawPitchRoll(scaled.scale(Math.PI / 180.0))
+        var closest = -1
+        var minDistance = Double.MAX_VALUE
+        quaternions.forEachIndexed {i, q->
+            val distance = q.distance(quaternion)
+            if (distance < minDistance) {
+                minDistance = distance
+                closest = i
             }
-            mGattCharacteristics!!.add(charas)
-            gattCharacteristicData.add(gattCharacteristicGroupData)
         }
 
-        val gattServiceAdapter = SimpleExpandableListAdapter(
-                this,
-                gattServiceData,
-                android.R.layout.simple_expandable_list_item_2,
-                arrayOf(LIST_NAME, LIST_UUID),
-                intArrayOf(android.R.id.text1, android.R.id.text2),
-                gattCharacteristicData,
-                android.R.layout.simple_expandable_list_item_2,
-                arrayOf(LIST_NAME, LIST_UUID),
-                intArrayOf(android.R.id.text1, android.R.id.text2)
-        )
-        mGattServicesList!!.setAdapter(gattServiceAdapter)
-    }
-
-    companion object {
-        private val TAG = DeviceControlActivity::class.java!!.getSimpleName()
-
-
-       @JvmField var EXTRAS_DEVICE_NAME = "DEVICE_NAME"
-       @JvmField var EXTRAS_DEVICE_ADDRESS = "DEVICE_ADDRESS"
-
-        private fun makeGattUpdateIntentFilter(): IntentFilter {
-            val intentFilter = IntentFilter()
-            intentFilter.addAction(BluetoothLeService.ACTION_GATT_CONNECTED)
-            intentFilter.addAction(BluetoothLeService.ACTION_GATT_DISCONNECTED)
-            intentFilter.addAction(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED)
-            intentFilter.addAction(BluetoothLeService.ACTION_DATA_AVAILABLE)
-            return intentFilter
+        if (pending != closest) {
+            pending = closest
+            pendingTime = System.currentTimeMillis()
+            mPendingField!!.text = closest.toString()
+        } else if (face != pending && System.currentTimeMillis() - pendingTime > CHANGE_TIME) {
+            face = pending
+            mFaceField!!.text = face.toString()
+            doAsync {
+                toggl.start("Project $face")
+            }
         }
     }
 
-
+    private fun shortBytesToDouble(b1: Byte, b2: Byte): Double {
+        return (((b1.toInt() and 255) shl 8) or (b2.toInt() and 255)).toShort() / Short.MAX_VALUE.toDouble()
+    }
 }

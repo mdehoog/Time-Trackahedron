@@ -78,6 +78,7 @@ class BluetoothLeService : Service() {
                                           characteristic: BluetoothGattCharacteristic,
                                           status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i(TAG, "onCharacteristicRead received: " + characteristic)
                 broadcastUpdate(ACTION_DATA_AVAILABLE, characteristic)
             }
         }
@@ -116,11 +117,19 @@ class BluetoothLeService : Service() {
         } else {
             // For all other profiles, writes the data formatted in HEX.
             val data = characteristic.value
-            if (data != null && data.size > 0) {
-                val stringBuilder = StringBuilder(data.size)
-                for (byteChar in data)
-                    stringBuilder.append(String.format("%02X ", byteChar))
-                intent.putExtra(EXTRA_DATA, String(data) + "\n" + stringBuilder.toString())
+            if (data != null && !data.isEmpty()) {
+                intent.putExtra(EXTRA_DATA, data)
+                /*val stringBuilder = StringBuilder(data.size)
+                if (data.size == 6) {
+                    for (i in 0..2) {
+                        stringBuilder.append("" + short(data[i * 2], data[i * 2 + 1]) + ", ")
+                    }
+                    intent.putExtra(EXTRA_DATA, stringBuilder.toString())
+                } else {
+                    for (byteChar in data)
+                        stringBuilder.append(String.format("%02X ", byteChar))
+                    intent.putExtra(EXTRA_DATA, String(data) + "\n" + stringBuilder.toString())
+                }*/
             }
         }
         sendBroadcast(intent)
@@ -270,12 +279,18 @@ class BluetoothLeService : Service() {
         mBluetoothGatt!!.setCharacteristicNotification(characteristic, enabled)
 
         // This is specific to Heart Rate Measurement.
-        if (UUID_HEART_RATE_MEASUREMENT == characteristic.uuid) {
+        if (enabled) {
             val descriptor = characteristic.getDescriptor(
                     UUID.fromString(SampleGattAttributes.CLIENT_CHARACTERISTIC_CONFIG))
             descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             mBluetoothGatt!!.writeDescriptor(descriptor)
         }
+    }
+
+    fun gattService(uuid: UUID): BluetoothGattService? {
+        if (mBluetoothGatt == null) return null
+
+        return mBluetoothGatt!!.getService(uuid)
     }
 
     /**
